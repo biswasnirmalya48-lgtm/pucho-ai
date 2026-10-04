@@ -1,0 +1,16 @@
+node_modules/
+dist/
+data/
+uploads/
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+.vite/
+coverage/
+*.tsbuildinfo
+
+# local-only env for the mock provider
+.env.mock
+.freebuff/
