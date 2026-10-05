@@ -4,7 +4,7 @@ import { dict, setMode, usePucho } from '../lib/store'
 import type { ModeId } from '../lib/types'
 
 /**
- * Mode selector. The user picks a mode; the server decides which GROQ model
+ * Mode selector. The user picks a mode; the server decides which model
  * answers. That split keeps model names out of the interface.
  */
 export default function ModePicker() {

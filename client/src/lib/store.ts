@@ -978,10 +978,10 @@ export function sendMessage(content?: string) {
     return
   }
 
-  if (state.status && !state.status.groq.configured) {
+  if (state.status && !state.status.provider.configured) {
     toast(
       'error',
-      "PUCHO isn't connected to GROQ yet. Add GROQ_API_KEY to .env and restart the server.",
+      "PUCHO isn't connected to a model yet. Add the provider API key to .env and restart the server.",
     )
   }
 
@@ -1101,8 +1101,8 @@ export async function bootstrap() {
       draft: readDraft(null),
       bootError: status ? null : 'PUCHO cannot reach the server right now.',
     })
-    if (status && !status.groq.configured) {
-      toast('warning', 'PUCHO is running without a GROQ key. Add GROQ_API_KEY to .env to chat.')
+    if (status && !status.provider.configured) {
+      toast('warning', 'PUCHO is running without a provider API key. Add the key to .env to chat.')
     }
   } catch (err) {
     setState({ ready: true, bootError: errorMessage(err, 'PUCHO could not start.') })

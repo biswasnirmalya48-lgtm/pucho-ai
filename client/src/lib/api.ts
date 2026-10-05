@@ -1,6 +1,6 @@
 /**
- * API client.  The browser only ever talks to the PUCHO server — GROQ
- * credentials stay on the server, so no secret is present in this bundle.
+ * API client.  The browser only ever talks to the PUCHO server — the
+ * provider credentials stay on the server, so no secret is present in this bundle.
  */
 import type {
   Attachment,

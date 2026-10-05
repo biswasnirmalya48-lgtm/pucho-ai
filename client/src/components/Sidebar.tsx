@@ -208,11 +208,11 @@ export default function Sidebar() {
 
         {state.status && (
           <div className="status-line">
-            <span className={`status-dot${state.status.groq.configured ? '' : ' status-dot--off'}`} />
+            <span className={`status-dot${state.status.provider.configured ? '' : ' status-dot--off'}`} />
             <span>
-              {state.status.groq.configured
-                ? `GROQ · ${state.status.modes.find((m) => m.id === state.mode)?.model ?? 'ready'}`
-                : 'Add GROQ_API_KEY to .env to connect'}
+              {state.status.provider.configured
+                ? `${state.status.modes.find((m) => m.id === state.mode)?.model ?? 'ready'}`
+                : 'Add the provider API key to .env to connect'}
             </span>
           </div>
         )}

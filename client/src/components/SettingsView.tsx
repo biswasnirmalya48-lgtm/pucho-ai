@@ -209,7 +209,7 @@ export default function SettingsView() {
           <div className="card">
             <h3 className="card__title">Model configuration</h3>
             <p className="card__desc">
-              Modes are mapped to GROQ models on the server. You never need to know the model names —
+              Modes are mapped to models on the server. You never need to know the model names —
               just pick a mode.
             </p>
             <div className="about-card" style={{ marginTop: 12 }}>
@@ -227,7 +227,7 @@ export default function SettingsView() {
               </div>
               <div className="about-card__row">
                 <span>API endpoint</span>
-                <span className="kv">{status?.groq.apiUrl ?? '—'}</span>
+                <span className="kv">{status?.provider.apiUrl ?? '—'}</span>
               </div>
             </div>
 
@@ -420,7 +420,7 @@ export default function SettingsView() {
             </div>
             <div className="about-card__row">
               <span>{t.poweredBy}</span>
-              <span className="kv">GROQ</span>
+              <span className="kv">{status?.provider.singleModel ?? 'configured'}</span>
             </div>
             <div className="about-card__row">
               <span>Web research</span>

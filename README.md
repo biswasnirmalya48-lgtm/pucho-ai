@@ -2,19 +2,19 @@
 
 > **Bas Pucho.** — Ask anything. Pucho everything.
 
-PUCHO is a fast, intelligent, friendly AI assistant. It streams answers from
-[GROQ](https://groq.com), keeps every conversation, understands projects and
+PUCHO is a fast, intelligent, friendly AI assistant. It streams answers from the
+AI provider you connect it to, keeps every conversation, understands projects and
 files, and talks in your language. It has its own identity — minimal black &
 white, glass used sparingly — and none of the usual AI-clone furniture.
 
 ```
-browser ──HTTP/SSE──▶ PUCHO server ──HTTPS──▶ GROQ API ──▶ model
+browser ──HTTP/SSE──▶ PUCHO server ──HTTPS──▶ AI provider API ──▶ model
                           │
                           └── SQLite (chats, messages, projects, files, settings)
                               node:sqlite locally · libSQL/Turso on Vercel
 ```
 
-The GROQ key is read from the environment **inside the server process only**.
+The provider API key is read from the environment **inside the server process only**.
 It is never sent to the browser, never bundled, and `.env` is git-ignored.
 
 ---
@@ -23,7 +23,7 @@ It is never sent to the browser, never bundled, and `.env` is git-ignored.
 
 ```bash
 npm install
-cp .env.example .env        # then paste your GROQ_API_KEY into .env
+cp .env.example .env        # then paste your provider API key into .env
 npm run build               # build the client
 npm start                   # http://127.0.0.1:8787
 ```
@@ -44,8 +44,8 @@ Everything is optional except `GROQ_API_KEY`. See [`.env.example`](.env.example)
 
 | Variable | Purpose |
 | --- | --- |
-| `GROQ_API_KEY` | Your GROQ key. Server-side only. |
-| `GROQ_API_URL` | Defaults to `https://api.groq.com/openai/v1`. |
+| `GROQ_API_KEY` | Your provider API key. Server-side only. |
+| `GROQ_API_URL` | The provider's OpenAI-compatible endpoint (defaults to the provider's hosted endpoint). |
 | `GROQ_MODEL` | One model for every mode (this project ships with `qwen/qwen3.8-27b`). |
 | `GROQ_MODEL_FAST` … `GROQ_MODEL_RESEARCH` | Optional per-mode overrides. |
 | `GROQ_MODEL_VISION` | Optional vision-capable model for image uploads. |
@@ -65,7 +65,7 @@ tried in this order:
 1. the mode's own env var (`GROQ_MODEL_THINK`, …)
 2. `GROQ_MODEL` — one model for everything
 3. a built-in default that the key can actually reach
-4. the first model GROQ reports for that key
+4. the first model the provider reports for that key
 
 `GET /api/status` reports the resolved model per mode, so **Settings → AI**
 always shows the truth. Vision capability is detected from the model id; if a
@@ -116,12 +116,12 @@ URLs. Supported providers: Tavily, Serper, Brave.
 | `npm test` | Unit tests (44) for validation, extraction, prompts, models, persistence, rate limiting. |
 | `npm run typecheck` | TypeScript check for the client. |
 | `node scripts/e2e-smoke.js` | End-to-end API suite (37 checks) against a running server. |
-| `node scripts/mock-provider.js` | Local GROQ + search stub for offline development. |
+| `node scripts/mock-provider.js` | Local AI-provider + search stub for offline development. |
 
 ### Testing without a key
 
 ```bash
-node scripts/mock-provider.js &          # GROQ-compatible stub on :9090
+node scripts/mock-provider.js &          # OpenAI-compatible stub on :9090
 GROQ_API_URL=http://127.0.0.1:9090/v1 \
 GROQ_API_KEY=local-test-key \
 GROQ_MODEL=mock-versatile \
@@ -193,7 +193,7 @@ driver at boot, so nothing above it knows or cares where state lives.
 
 | Symptom | Cause / fix |
 | --- | --- |
-| *“PUCHO isn't connected to a model yet.”* | `GROQ_API_KEY` missing — check `.env`, restart. |
+| *“PUCHO isn't connected to a model yet.”* | The provider API key is missing — check `.env`, restart. |
 | *“PUCHO is getting too many requests at once.”* | Provider rate limit (often output tokens per minute). PUCHO retries once automatically; wait a moment and send again. |
 | *“…can't read images yet.”* | The configured model has no vision. Set `GROQ_MODEL_VISION`, or pick a vision-capable model. |
 | *“Live web research is not configured.”* | Add a Tavily/Serper/Brave key for live sources. |
@@ -219,7 +219,7 @@ mapping behave identically.
 
 Notes:
 
-- The GROQ key is a server-side variable only — never prefix it with `NEXT_PUBLIC_`.
+- The provider API key is a server-side variable only — never prefix it with `NEXT_PUBLIC_`.
 - `maxDuration` is 60s so a long answer can finish streaming.
 - Cold starts reuse the Turso connection between invocations on the same instance.
 - Rate limits are per-instance, so they are approximate across many concurrent
@@ -238,7 +238,7 @@ server/
   config.js           env, limits, per-mode model defaults
   db.js               schema + queries (async, driver-agnostic)
   routes/             chat (SSE), conversations, projects, files, settings, status, voice
-  services/           groq client, model resolution, prompt, titling, web search, extraction, tts
+  services/           provider client, model resolution, prompt, titling, web search, extraction, tts
   lib/                validation, SSE writer
 client/
   src/components/     sidebar, thread, message, markdown, composer, modes, projects, settings…

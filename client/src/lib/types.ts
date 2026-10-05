@@ -92,7 +92,7 @@ export interface ModeInfo {
 
 export interface ServerStatus {
   app: { name: string; version: string; tagline: string }
-  groq: { configured: boolean; apiUrl: string; singleModel: string | null; modelError: string | null }
+  provider: { configured: boolean; apiUrl: string; singleModel: string | null; modelError: string | null }
   modes: ModeInfo[]
   vision: { available: boolean; model: string | null }
   webSearch: { available: boolean; provider: string | null }
