@@ -37,18 +37,18 @@ function validatePatch(body = {}) {
   return patch
 }
 
-router.get('/', rateLimit('read'), (req, res) => {
-  res.json({ settings: settings.getAll(), defaults: DEFAULT_SETTINGS })
+router.get('/', rateLimit('read'), async (req, res) => {
+  res.json({ settings: await settings.getAll(), defaults: DEFAULT_SETTINGS })
 })
 
-router.patch('/', rateLimit('write'), (req, res) => {
+router.patch('/', rateLimit('write'), async (req, res) => {
   const patch = validatePatch(req.body)
-  if (!Object.keys(patch).length) return res.json({ settings: settings.getAll() })
-  return res.json({ settings: settings.set(patch) })
+  if (!Object.keys(patch).length) return res.json({ settings: await settings.getAll() })
+  return res.json({ settings: await settings.set(patch) })
 })
 
-router.post('/reset', rateLimit('write'), (req, res) => {
-  res.json({ settings: settings.reset() })
+router.post('/reset', rateLimit('write'), async (req, res) => {
+  res.json({ settings: await settings.reset() })
 })
 
 export default router

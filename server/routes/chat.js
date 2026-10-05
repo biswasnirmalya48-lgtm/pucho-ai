@@ -9,9 +9,9 @@
  *   5. stream GROQ deltas to the client over SSE and persist the answer
  */
 import express from 'express'
-import fs from 'node:fs'
 
 import { createSse } from '../lib/sse.js'
+import * as storage from '../storage.js'
 import { validateChatBody, ValidationError } from '../lib/validate.js'
 import { rateLimit } from '../middleware/rateLimit.js'
 import { logger } from '../middleware/errors.js'
@@ -26,9 +26,8 @@ import { searchWeb } from '../services/websearch.js'
 const router = express.Router()
 
 /** Prior turns for the model, newest-windowed, excluding the turn sent as prompt. */
-function buildHistory(conversationId, excludeIds = []) {
-  const rows = messages
-    .listByConversation(conversationId, { limit: LIMITS.historyMessages + 10 })
+async function buildHistory(conversationId, excludeIds = []) {
+  const rows = (await messages.listByConversation(conversationId, { limit: LIMITS.historyMessages + 10 }))
     .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content.trim())
     .filter((m) => m.status !== 'error')
     .filter((m) => !excludeIds.includes(m.id))
@@ -44,14 +43,33 @@ function buildHistory(conversationId, excludeIds = []) {
   return out
 }
 
-function loadImageDataUrl(row) {
+async function loadImageDataUrl(row) {
   if (!SUPPORTED_IMAGE_TYPES.has(row.mime)) return null
   if (row.size > LIMITS.imageBytes) return null
   try {
-    return `data:${row.mime};base64,${fs.readFileSync(row.stored_path).toString('base64')}`
+    const stored = await storage.read(row.stored_path)
+    if (!stored) return null
+    return `data:${row.mime};base64,${stored.buffer.toString('base64')}`
   } catch {
     return null
   }
+}
+
+/** Resolve attachment ids to raw rows, dropping any that have since vanished. */
+async function loadRawRows(ids = []) {
+  const rows = await Promise.all(ids.map((id) => files.rawRow(id)))
+  return rows.filter(Boolean)
+}
+
+/** Inline every usable image for a vision-capable model. */
+async function inlineImages(rows, { requireImageKind = false } = {}) {
+  const candidates = rows.filter((f) =>
+    requireImageKind
+      ? f.kind === 'image' && SUPPORTED_IMAGE_TYPES.has(f.mime)
+      : SUPPORTED_IMAGE_TYPES.has(f.mime),
+  )
+  const urls = await Promise.all(candidates.map(loadImageDataUrl))
+  return urls.filter(Boolean)
 }
 
 const fileDescriptor = (row) => ({
@@ -78,7 +96,7 @@ I did **not** look at the image, so I will not guess what is in it.`
 
 async function streamReply({ body, rawBody, sse, controller, req }) {
   const signal = controller.signal
-  const userSettings = settings.getAll()
+  const userSettings = await settings.getAll()
   const projectProvided = Object.prototype.hasOwnProperty.call(rawBody || {}, 'projectId')
 
   /* ---------------------------------------------------------------- *
@@ -86,7 +104,7 @@ async function streamReply({ body, rawBody, sse, controller, req }) {
    * ---------------------------------------------------------------- */
   let conversation = null
   if (body.conversationId) {
-    conversation = conversations.get(body.conversationId)
+    conversation = await conversations.get(body.conversationId)
     if (!conversation) {
       throw new ValidationError('That conversation is no longer here, so this is a fresh one.', {
         code: 'not_found',
@@ -98,21 +116,23 @@ async function streamReply({ body, rawBody, sse, controller, req }) {
     throw new ValidationError('Open a conversation first, then try that again.', { field: 'conversationId' })
   }
 
-  let project = conversation?.projectId ? projects.get(conversation.projectId) : null
+  let project = conversation?.projectId ? await projects.get(conversation.projectId) : null
   if (projectProvided) {
-    project = body.projectId ? projects.get(body.projectId) : null
+    project = body.projectId ? await projects.get(body.projectId) : null
     if (body.projectId && !project) {
       throw new ValidationError('That project no longer exists.', { code: 'not_found', status: 404 })
     }
-    if (conversation) conversation = conversations.update(conversation.id, { projectId: project?.id ?? null })
+    if (conversation) {
+      conversation = await conversations.update(conversation.id, { projectId: project?.id ?? null })
+    }
   }
 
   const mode = normalizeMode(body.mode || conversation?.mode || userSettings.defaultMode)
   if (!conversation) {
-    assertConversationLimit()
-    conversation = conversations.create({ mode, projectId: project?.id ?? null })
+    await assertConversationLimit()
+    conversation = await conversations.create({ mode, projectId: project?.id ?? null })
   } else if (conversation.mode !== mode) {
-    conversation = conversations.update(conversation.id, { mode })
+    conversation = await conversations.update(conversation.id, { mode })
   }
 
   /* ---------------------------------------------------------------- *
@@ -127,61 +147,54 @@ async function streamReply({ body, rawBody, sse, controller, req }) {
   let replacedIds = []
 
   if (body.action === 'truncate') {
-    const target = messages.get(body.messageId)
+    const target = await messages.get(body.messageId)
     if (!target) throw new ValidationError('That message is already gone.', { code: 'not_found', status: 404 })
     if (target.conversationId !== conversation.id) {
       throw new ValidationError('That message belongs to a different conversation.', { status: 400 })
     }
-    const removed = messages.removeFrom(target.id)
+    const removed = await messages.removeFrom(target.id)
     sse.send('open', { conversationId: conversation.id })
     sse.send('truncated', {
       conversationId: conversation.id,
       removedIds: removed.map((m) => m.id),
-      messages: messages.listByConversation(conversation.id, { limit: 200 }),
+      messages: await messages.listByConversation(conversation.id, { limit: 200 }),
       conversation,
     })
     return
   }
 
   if (body.action === 'regenerate') {
-    const target = messages.get(body.messageId)
+    const target = await messages.get(body.messageId)
     if (!target) throw new ValidationError('That message is already gone.', { code: 'not_found', status: 404 })
     if (target.conversationId !== conversation.id) {
       throw new ValidationError('That message belongs to a different conversation.', { status: 400 })
     }
-    const prior = messages
-      .listByConversation(conversation.id, { limit: 200 })
+    const prior = (await messages.listByConversation(conversation.id, { limit: 200 }))
       .filter((m) => m.position < target.position && m.role === 'user' && m.content.trim())
       .pop()
     if (!prior) {
       throw new ValidationError('There is no question left to answer — send a new message.', { status: 400 })
     }
-    replacedIds = messages.removeFrom(target.id).map((m) => m.id)
+    replacedIds = (await messages.removeFrom(target.id)).map((m) => m.id)
     prompt = prior.content
     userMessage = prior
-    attachmentRows = (prior.attachments || []).map((a) => files.rawRow(a.id)).filter(Boolean)
-    images = attachmentRows
-      .filter((f) => SUPPORTED_IMAGE_TYPES.has(f.mime))
-      .map(loadImageDataUrl)
-      .filter(Boolean)
+    attachmentRows = await loadRawRows((prior.attachments || []).map((a) => a.id))
+    images = await inlineImages(attachmentRows)
   } else if (body.action === 'continue') {
-    const target = messages.get(body.messageId)
+    const target = await messages.get(body.messageId)
     if (!target) throw new ValidationError('That message is already gone.', { code: 'not_found', status: 404 })
     if (target.conversationId !== conversation.id) {
       throw new ValidationError('That message belongs to a different conversation.', { status: 400 })
     }
-    assistantMessage = messages.update(target.id, { status: 'streaming' })
+    assistantMessage = await messages.update(target.id, { status: 'streaming' })
     prompt =
       'Continue that answer from exactly where it stopped. Do not repeat what you already wrote, do not restart, and do not add a preamble.'
   } else {
     // Raw rows: the stored path is needed to inline images for vision models.
-    attachmentRows = body.attachmentIds.map((id) => files.rawRow(id)).filter(Boolean)
-    images = attachmentRows
-      .filter((f) => f.kind === 'image' && SUPPORTED_IMAGE_TYPES.has(f.mime))
-      .map(loadImageDataUrl)
-      .filter(Boolean)
+    attachmentRows = await loadRawRows(body.attachmentIds)
+    images = await inlineImages(attachmentRows, { requireImageKind: true })
 
-    userMessage = messages.add({
+    userMessage = await messages.add({
       conversationId: conversation.id,
       role: 'user',
       content: body.content,
@@ -189,14 +202,14 @@ async function streamReply({ body, rawBody, sse, controller, req }) {
       status: 'complete',
       attachments: attachmentRows.map(fileDescriptor),
     })
-    files.attach(
+    await files.attach(
       attachmentRows.map((f) => f.id),
       { conversationId: conversation.id, messageId: userMessage.id },
     )
     prompt = body.content
   }
 
-  const history = buildHistory(conversation.id, [userMessage?.id].filter(Boolean))
+  const history = await buildHistory(conversation.id, [userMessage?.id].filter(Boolean))
 
   /* ---------------------------------------------------------------- *
    * 3. Auto title (runs alongside the stream, never blocks it)
@@ -205,7 +218,7 @@ async function streamReply({ body, rawBody, sse, controller, req }) {
     generateTitle({ text: prompt })
       .then(({ title }) => {
         if (!title) return
-        conversations.update(conversation.id, { title })
+        conversations.update(conversation.id, { title }).catch(() => {})
         sse.send('title', { conversationId: conversation.id, title })
       })
       .catch(() => {})
@@ -227,7 +240,7 @@ async function streamReply({ body, rawBody, sse, controller, req }) {
 
   if (model.visionBlocked) {
     const notice = VISION_BLOCKED_MESSAGE.replace('{MODEL}', model.id)
-    const saved = messages.add({
+    const saved = await messages.add({
       conversationId: conversation.id,
       role: 'assistant',
       content: notice,
@@ -244,12 +257,12 @@ async function streamReply({ body, rawBody, sse, controller, req }) {
       notice: true,
     })
     sse.send('delta', { text: notice })
-    sse.send('done', { message: saved, conversation: conversations.get(conversation.id) })
+    sse.send('done', { message: saved, conversation: await conversations.get(conversation.id) })
     return
   }
 
   if (!assistantMessage) {
-    assistantMessage = messages.add({
+    assistantMessage = await messages.add({
       conversationId: conversation.id,
       role: 'assistant',
       content: '',
@@ -286,7 +299,7 @@ async function streamReply({ body, rawBody, sse, controller, req }) {
   /* ---------------------------------------------------------------- *
    * 6. Prompt assembly + streaming
    * ---------------------------------------------------------------- */
-  const projectFiles = project ? files.list({ projectId: project.id, limit: 40 }) : []
+  const projectFiles = project ? await files.list({ projectId: project.id, limit: 40 }) : []
   const projectContext = [
     project?.context || '',
     projectFiles.length
@@ -333,7 +346,7 @@ async function streamReply({ body, rawBody, sse, controller, req }) {
       },
     })
 
-    const saved = messages.update(assistantMessage.id, {
+    const saved = await messages.update(assistantMessage.id, {
       content: assistantMessage.content + result.content,
       status: 'complete',
       sources: web?.status === 'ok' ? web.results : [],
@@ -341,20 +354,20 @@ async function streamReply({ body, rawBody, sse, controller, req }) {
     sse.send('done', {
       message: saved,
       elapsedMs: Date.now() - assistantStartedAt,
-      conversation: conversations.get(conversation.id),
+      conversation: await conversations.get(conversation.id),
     })
   } catch (err) {
     const aborted = signal.aborted || err?.code === 'aborted'
     const partial = streamed.trim()
     let saved = null
     if (partial || assistantMessage.content) {
-      saved = messages.update(assistantMessage.id, {
+      saved = await messages.update(assistantMessage.id, {
         content: assistantMessage.content + partial,
         status: partial ? (aborted ? 'stopped' : 'error') : assistantMessage.content ? 'complete' : 'error',
         sources: web?.status === 'ok' ? web.results : [],
       })
     } else {
-      messages.remove(assistantMessage.id)
+      await messages.remove(assistantMessage.id)
     }
 
     const publicError =
@@ -372,7 +385,7 @@ async function streamReply({ body, rawBody, sse, controller, req }) {
       aborted: !!aborted,
       partial: partial.length > 0,
       assistantMessageId: saved?.id ?? null,
-      conversation: conversations.get(conversation.id),
+      conversation: await conversations.get(conversation.id),
     })
   }
 }

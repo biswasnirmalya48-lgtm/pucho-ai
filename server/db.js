@@ -1,16 +1,19 @@
 /**
- * SQLite persistence for PUCHO (node:sqlite, no native build step).
+ * PUCHO persistence.
  *
- * Conversations, messages, projects, uploads and settings all live here so the
- * browser never has to hold the whole history and multi-tab usage stays sane.
+ * Conversations, messages, projects, uploads and settings all live in one
+ * SQLite database so the browser never has to hold the whole history and
+ * multi-tab usage stays sane.
+ *
+ * The SQL itself is driver-agnostic (see `driver.js`): locally it runs on
+ * `node:sqlite`, and on Vercel it runs on a remote libSQL / Turso database
+ * because serverless functions have no persistent disk. Every function here
+ * is therefore async.
  */
-import fs from 'node:fs'
-import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { DatabaseSync } from 'node:sqlite'
-import { DB_PATH, ensureDirs, LIMITS, DEFAULT_MODE } from './config.js'
-
-let db = null
+import * as driver from './driver.js'
+import * as storage from './storage.js'
+import { LIMITS, DEFAULT_MODE } from './config.js'
 
 export const newId = () => randomUUID()
 export const nowIso = () => new Date().toISOString()
@@ -74,18 +77,6 @@ CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id
 CREATE INDEX IF NOT EXISTS idx_files_conversation ON files(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_files_project ON files(project_id);
 `
-
-export function getDb() {
-  if (db) return db
-  ensureDirs()
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
-  db = new DatabaseSync(DB_PATH)
-  db.exec('PRAGMA journal_mode = WAL')
-  db.exec('PRAGMA foreign_keys = ON')
-  db.exec('PRAGMA busy_timeout = 5000')
-  db.exec(SCHEMA)
-  return db
-}
 
 const parseJson = (value, fallback) => {
   if (!value) return fallback
@@ -168,31 +159,35 @@ export function mapFile(row) {
 
 /* ----------------------------- conversations ---------------------------- */
 
+// Register the schema as soon as this module loads, so the driver creates the
+// tables on first use even if a caller never invokes `initDb()`. The catch
+// only silences Node's unhandled-rejection warning; `ensureReady()` still
+// surfaces the failure to whichever query triggers it.
+driver.init(SCHEMA).catch(() => {})
+
 export const conversations = {
-  create({ title = '', mode = DEFAULT_MODE, projectId = null, id } = {}) {
-    const conn = getDb()
+  async create({ title = '', mode = DEFAULT_MODE, projectId = null, id } = {}) {
     const now = nowIso()
     const convId = id || newId()
-    conn
-      .prepare(
-        `INSERT INTO conversations (id, title, mode, project_id, archived, pinned, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 0, 0, ?, ?)`,
-      )
-      .run(convId, title, mode, projectId, now, now)
+    await driver.run(
+      `INSERT INTO conversations (id, title, mode, project_id, archived, pinned, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 0, 0, ?, ?)`,
+      [convId, title, mode, projectId, now, now],
+    )
     return this.get(convId)
   },
 
-  get(id) {
+  async get(id) {
     if (!id) return null
-    return mapConversation(getDb().prepare(`SELECT * FROM conversations WHERE id = ?`).get(id))
+    return mapConversation(await driver.get(`SELECT * FROM conversations WHERE id = ?`, [id]))
   },
 
-  exists(id) {
+  async exists(id) {
     if (!id) return false
-    return !!getDb().prepare(`SELECT 1 AS ok FROM conversations WHERE id = ?`).get(id)
+    return !!(await driver.get(`SELECT 1 AS ok FROM conversations WHERE id = ?`, [id]))
   },
 
-  list({ query = '', archived = false, projectId = null, limit = 300, offset = 0 } = {}) {
+  async list({ query = '', archived = false, projectId = null, limit = 300, offset = 0 } = {}) {
     const where = ['archived = ?']
     const params = [archived ? 1 : 0]
     if (projectId) {
@@ -204,30 +199,29 @@ export const conversations = {
       params.push(`%${query.trim()}%`, `%${query.trim()}%`)
     }
     params.push(limit, offset)
-    const rows = getDb()
-      .prepare(
-        `SELECT c.*,
-                (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count,
-                (SELECT m.content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.position DESC LIMIT 1) AS preview,
-                (SELECT p.name FROM projects p WHERE p.id = c.project_id) AS project_name
-         FROM conversations c
-         WHERE ${where.join(' AND ')}
-         ORDER BY c.pinned DESC, c.updated_at DESC
-         LIMIT ? OFFSET ?`,
-      )
-      .all(...params)
+    const rows = await driver.all(
+      `SELECT c.*,
+              (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count,
+              (SELECT m.content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.position DESC LIMIT 1) AS preview,
+              (SELECT p.name FROM projects p WHERE p.id = c.project_id) AS project_name
+       FROM conversations c
+       WHERE ${where.join(' AND ')}
+       ORDER BY c.pinned DESC, c.updated_at DESC
+       LIMIT ? OFFSET ?`,
+      params,
+    )
     return rows.map(mapConversation)
   },
 
-  count({ archived = false } = {}) {
-    const row = getDb()
-      .prepare(`SELECT COUNT(*) AS n FROM conversations WHERE archived = ?`)
-      .get(archived ? 1 : 0)
+  async count({ archived = false } = {}) {
+    const row = await driver.get(`SELECT COUNT(*) AS n FROM conversations WHERE archived = ?`, [
+      archived ? 1 : 0,
+    ])
     return row?.n ?? 0
   },
 
-  update(id, patch = {}) {
-    const current = this.get(id)
+  async update(id, patch = {}) {
+    const current = await this.get(id)
     if (!current) return null
     const fields = []
     const params = []
@@ -243,46 +237,51 @@ export const conversations = {
     if (patch.touch !== false) set('updated_at', nowIso())
     if (!fields.length) return current
     params.push(id)
-    getDb().prepare(`UPDATE conversations SET ${fields.join(', ')} WHERE id = ?`).run(...params)
+    await driver.run(`UPDATE conversations SET ${fields.join(', ')} WHERE id = ?`, params)
     return this.get(id)
   },
 
-  touch(id) {
-    getDb().prepare(`UPDATE conversations SET updated_at = ? WHERE id = ?`).run(nowIso(), id)
+  async touch(id) {
+    await driver.run(`UPDATE conversations SET updated_at = ? WHERE id = ?`, [nowIso(), id])
   },
 
   /** Deleting a conversation also removes its messages and stored files. */
-  remove(id) {
-    const conn = getDb()
-    const files = conn.prepare(`SELECT * FROM files WHERE conversation_id = ?`).all(id)
-    conn.prepare(`DELETE FROM conversations WHERE id = ?`).run(id)
-    for (const row of files) {
-      conn.prepare(`DELETE FROM files WHERE id = ?`).run(row.id)
-      try {
-        fs.rmSync(row.stored_path, { force: true })
-      } catch {
-        /* file already gone — nothing to clean up */
-      }
+  async remove(id) {
+    const rows = await driver.all(`SELECT * FROM files WHERE conversation_id = ?`, [id])
+    await driver.run(`DELETE FROM conversations WHERE id = ?`, [id])
+    const removed = []
+    for (const row of rows) {
+      await driver.run(`DELETE FROM files WHERE id = ?`, [row.id])
+      await storage.remove(row.stored_path)
+      removed.push(row.stored_path)
     }
-    return { files: files.map((f) => f.stored_path) }
+    return { files: removed }
   },
 }
 
 /* -------------------------------- messages ------------------------------ */
 
 export const messages = {
-  add({ conversationId, role, content = '', mode = null, status = 'complete', sources = [], attachments = [], id } = {}) {
-    const conn = getDb()
+  async add({
+    conversationId,
+    role,
+    content = '',
+    mode = null,
+    status = 'complete',
+    sources = [],
+    attachments = [],
+    id,
+  } = {}) {
     const msgId = id || newId()
-    const next = conn
-      .prepare(`SELECT COALESCE(MAX(position), -1) + 1 AS next FROM messages WHERE conversation_id = ?`)
-      .get(conversationId).next
-    conn
-      .prepare(
-        `INSERT INTO messages (id, conversation_id, role, content, mode, status, sources, attachments, position, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    const row = await driver.get(
+      `SELECT COALESCE(MAX(position), -1) + 1 AS next FROM messages WHERE conversation_id = ?`,
+      [conversationId],
+    )
+    const next = Number(row?.next ?? 0)
+    await driver.run(
+      `INSERT INTO messages (id, conversation_id, role, content, mode, status, sources, attachments, position, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
         msgId,
         conversationId,
         role,
@@ -293,16 +292,17 @@ export const messages = {
         JSON.stringify(attachments ?? []),
         next,
         nowIso(),
-      )
-    conversations.touch(conversationId)
+      ],
+    )
+    await conversations.touch(conversationId)
     return this.get(msgId)
   },
 
-  get(id) {
-    return mapMessage(getDb().prepare(`SELECT * FROM messages WHERE id = ?`).get(id))
+  async get(id) {
+    return mapMessage(await driver.get(`SELECT * FROM messages WHERE id = ?`, [id]))
   },
 
-  listByConversation(conversationId, { limit = 500, before = null } = {}) {
+  async listByConversation(conversationId, { limit = 500, before = null } = {}) {
     const params = [conversationId]
     let sql = `SELECT * FROM messages WHERE conversation_id = ?`
     if (before !== null && before !== undefined) {
@@ -311,16 +311,19 @@ export const messages = {
     }
     sql += ` ORDER BY position DESC LIMIT ?`
     params.push(limit)
-    const rows = getDb().prepare(sql).all(...params)
+    const rows = await driver.all(sql, params)
     return rows.reverse().map(mapMessage)
   },
 
-  countByConversation(conversationId) {
-    return getDb().prepare(`SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?`).get(conversationId).n
+  async countByConversation(conversationId) {
+    const row = await driver.get(`SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?`, [
+      conversationId,
+    ])
+    return row?.n ?? 0
   },
 
-  update(id, patch = {}) {
-    const current = this.get(id)
+  async update(id, patch = {}) {
+    const current = await this.get(id)
     if (!current) return null
     const fields = []
     const params = []
@@ -342,39 +345,39 @@ export const messages = {
     }
     if (!fields.length) return current
     params.push(id)
-    getDb().prepare(`UPDATE messages SET ${fields.join(', ')} WHERE id = ?`).run(...params)
+    await driver.run(`UPDATE messages SET ${fields.join(', ')} WHERE id = ?`, params)
     return this.get(id)
   },
 
   /** Delete a single message row (used to discard an empty failed turn). */
-  remove(id) {
-    const conn = getDb()
-    conn.prepare(`UPDATE files SET message_id = NULL WHERE message_id = ?`).run(id)
-    conn.prepare(`DELETE FROM messages WHERE id = ?`).run(id)
+  async remove(id) {
+    await driver.run(`UPDATE files SET message_id = NULL WHERE message_id = ?`, [id])
+    await driver.run(`DELETE FROM messages WHERE id = ?`, [id])
     return true
   },
 
   /** Delete a message and everything after it in that conversation. */
-  removeFrom(id) {
-    const conn = getDb()
-    const msg = this.get(id)
+  async removeFrom(id) {
+    const msg = await this.get(id)
     if (!msg) return null
-    const removed = conn
-      .prepare(`SELECT * FROM messages WHERE conversation_id = ? AND position >= ?`)
-      .all(msg.conversationId, msg.position)
-    conn
-      .prepare(`DELETE FROM messages WHERE conversation_id = ? AND position >= ?`)
-      .run(msg.conversationId, msg.position)
+    const removed = await driver.all(
+      `SELECT * FROM messages WHERE conversation_id = ? AND position >= ?`,
+      [msg.conversationId, msg.position],
+    )
+    await driver.run(`DELETE FROM messages WHERE conversation_id = ? AND position >= ?`, [
+      msg.conversationId,
+      msg.position,
+    ])
     for (const row of removed) {
-      conn.prepare(`UPDATE files SET message_id = NULL WHERE message_id = ?`).run(row.id)
+      await driver.run(`UPDATE files SET message_id = NULL WHERE message_id = ?`, [row.id])
     }
-    conversations.touch(msg.conversationId)
+    await conversations.touch(msg.conversationId)
     return removed.map(mapMessage)
   },
 
   /** History for the model, newest-first slice, returned oldest-first. */
-  historyFor(conversationId, { limit = LIMITS.historyMessages, maxChars = LIMITS.historyChars } = {}) {
-    const rows = this.listByConversation(conversationId, { limit: limit + 4 })
+  async historyFor(conversationId, { limit = LIMITS.historyMessages, maxChars = LIMITS.historyChars } = {}) {
+    const rows = (await this.listByConversation(conversationId, { limit: limit + 4 }))
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .filter((m) => (m.status === 'complete' || m.status === 'stopped') && m.content.trim())
       .slice(-limit)
@@ -393,38 +396,34 @@ export const messages = {
 /* -------------------------------- projects ------------------------------ */
 
 export const projects = {
-  create({ name, description = '', instructions = '', context = '', accent = 'violet' } = {}) {
-    const conn = getDb()
+  async create({ name, description = '', instructions = '', context = '', accent = 'violet' } = {}) {
     const now = nowIso()
     const id = newId()
-    conn
-      .prepare(
-        `INSERT INTO projects (id, name, description, instructions, context, accent, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(id, name, description, instructions, context, accent, now, now)
+    await driver.run(
+      `INSERT INTO projects (id, name, description, instructions, context, accent, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, name, description, instructions, context, accent, now, now],
+    )
     return this.get(id)
   },
 
-  get(id) {
+  async get(id) {
     if (!id) return null
-    return mapProject(getDb().prepare(`SELECT * FROM projects WHERE id = ?`).get(id))
+    return mapProject(await driver.get(`SELECT * FROM projects WHERE id = ?`, [id]))
   },
 
-  list() {
-    return getDb()
-      .prepare(
-        `SELECT p.*,
-                (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id AND c.archived = 0) AS conversation_count,
-                (SELECT COUNT(*) FROM files f WHERE f.project_id = p.id) AS file_count
-         FROM projects p ORDER BY p.updated_at DESC`,
-      )
-      .all()
-      .map(mapProject)
+  async list() {
+    const rows = await driver.all(
+      `SELECT p.*,
+              (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id AND c.archived = 0) AS conversation_count,
+              (SELECT COUNT(*) FROM files f WHERE f.project_id = p.id) AS file_count
+       FROM projects p ORDER BY p.updated_at DESC`,
+    )
+    return rows.map(mapProject)
   },
 
-  update(id, patch = {}) {
-    const current = this.get(id)
+  async update(id, patch = {}) {
+    const current = await this.get(id)
     if (!current) return null
     const fields = []
     const params = []
@@ -439,38 +438,29 @@ export const projects = {
     if (patch.accent !== undefined) set('accent', String(patch.accent).slice(0, 24))
     set('updated_at', nowIso())
     params.push(id)
-    getDb().prepare(`UPDATE projects SET ${fields.join(', ')} WHERE id = ?`).run(...params)
+    await driver.run(`UPDATE projects SET ${fields.join(', ')} WHERE id = ?`, params)
     return this.get(id)
   },
 
-  remove(id) {
-    const conn = getDb()
-    conn.prepare(`UPDATE conversations SET project_id = NULL WHERE project_id = ?`).run(id)
-    const files = conn.prepare(`SELECT stored_path FROM files WHERE project_id = ?`).all(id)
-    conn.prepare(`DELETE FROM files WHERE project_id = ?`).run(id)
-    for (const row of files) {
-      try {
-        fs.rmSync(row.stored_path, { force: true })
-      } catch {
-        /* already removed */
-      }
-    }
-    conn.prepare(`DELETE FROM projects WHERE id = ?`).run(id)
+  async remove(id) {
+    await driver.run(`UPDATE conversations SET project_id = NULL WHERE project_id = ?`, [id])
+    const files = await driver.all(`SELECT stored_path FROM files WHERE project_id = ?`, [id])
+    await driver.run(`DELETE FROM files WHERE project_id = ?`, [id])
+    for (const row of files) await storage.remove(row.stored_path)
+    await driver.run(`DELETE FROM projects WHERE id = ?`, [id])
   },
 }
 
 /* --------------------------------- files -------------------------------- */
 
 export const files = {
-  create(row) {
+  async create(row) {
     const id = row.id || newId()
-    getDb()
-      .prepare(
-        `INSERT INTO files (id, name, size, mime, kind, stored_path, text, truncated, page_count, warning,
-                            conversation_id, message_id, project_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    await driver.run(
+      `INSERT INTO files (id, name, size, mime, kind, stored_path, text, truncated, page_count, warning,
+                          conversation_id, message_id, project_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
         id,
         row.name,
         row.size,
@@ -485,19 +475,20 @@ export const files = {
         row.messageId ?? null,
         row.projectId ?? null,
         nowIso(),
-      )
+      ],
+    )
     return this.get(id)
   },
 
-  get(id) {
-    return mapFile(getDb().prepare(`SELECT * FROM files WHERE id = ?`).get(id))
+  async get(id) {
+    return mapFile(await driver.get(`SELECT * FROM files WHERE id = ?`, [id]))
   },
 
-  rawRow(id) {
-    return getDb().prepare(`SELECT * FROM files WHERE id = ?`).get(id) || null
+  async rawRow(id) {
+    return (await driver.get(`SELECT * FROM files WHERE id = ?`, [id])) || null
   },
 
-  list({ conversationId = null, projectId = null, limit = 200 } = {}) {
+  async list({ conversationId = null, projectId = null, limit = 200 } = {}) {
     const params = []
     const where = []
     if (conversationId) {
@@ -510,31 +501,27 @@ export const files = {
     }
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : ''
     params.push(limit)
-    return getDb()
-      .prepare(`SELECT * FROM files ${clause} ORDER BY created_at DESC LIMIT ?`)
-      .all(...params)
-      .map(mapFile)
+    const rows = await driver.all(
+      `SELECT * FROM files ${clause} ORDER BY created_at DESC LIMIT ?`,
+      params,
+    )
+    return rows.map(mapFile)
   },
 
-  attach(ids, { conversationId, messageId = null }) {
-    const conn = getDb()
-    for (const id of ids) {
-      conn
-        .prepare(`UPDATE files SET conversation_id = ?, message_id = ? WHERE id = ?`)
-        .run(conversationId, messageId, id)
-    }
+  async attach(ids, { conversationId, messageId = null }) {
+    await driver.batch(
+      ids.map((id) => ({
+        sql: `UPDATE files SET conversation_id = ?, message_id = ? WHERE id = ?`,
+        params: [conversationId, messageId, id],
+      })),
+    )
   },
 
-  remove(id) {
-    const conn = getDb()
-    const row = this.rawRow(id)
+  async remove(id) {
+    const row = await this.rawRow(id)
     if (!row) return false
-    conn.prepare(`DELETE FROM files WHERE id = ?`).run(id)
-    try {
-      fs.rmSync(row.stored_path, { force: true })
-    } catch {
-      /* already removed */
-    }
+    await driver.run(`DELETE FROM files WHERE id = ?`, [id])
+    await storage.remove(row.stored_path)
     return true
   },
 }
@@ -557,8 +544,8 @@ export const DEFAULT_SETTINGS = {
 }
 
 export const settings = {
-  getAll() {
-    const rows = getDb().prepare(`SELECT key, value FROM settings`).all()
+  async getAll() {
+    const rows = await driver.all(`SELECT key, value FROM settings`)
     const stored = {}
     for (const row of rows) {
       try {
@@ -570,39 +557,60 @@ export const settings = {
     return { ...DEFAULT_SETTINGS, ...stored }
   },
 
-  set(patch = {}) {
-    const conn = getDb()
-    const stmt = conn.prepare(
-      `INSERT INTO settings (key, value) VALUES (?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  async set(patch = {}) {
+    await driver.batch(
+      Object.entries(patch)
+        .filter(([key]) => key in DEFAULT_SETTINGS)
+        .map(([key, value]) => ({
+          sql: `INSERT INTO settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+          params: [key, JSON.stringify(value)],
+        })),
     )
-    for (const [key, value] of Object.entries(patch)) {
-      if (!(key in DEFAULT_SETTINGS)) continue
-      stmt.run(key, JSON.stringify(value))
-    }
     return this.getAll()
   },
 
-  reset() {
-    getDb().prepare(`DELETE FROM settings`).run()
+  async reset() {
+    await driver.run(`DELETE FROM settings`)
     return this.getAll()
   },
 }
 
-export function initDb() {
-  return getDb()
+/* -------------------------------- search -------------------------------- */
+
+/** Full-text-ish search across titles and message bodies. */
+export async function searchConversations(query, limit = 400) {
+  const like = `%${query}%`
+  return driver.all(
+    `SELECT c.id, c.title, c.updated_at, c.archived, c.project_id,
+            m.role, m.content, m.position
+     FROM conversations c
+     LEFT JOIN messages m ON m.conversation_id = c.id
+     WHERE c.title LIKE ? COLLATE NOCASE
+        OR m.content LIKE ? COLLATE NOCASE
+     ORDER BY c.updated_at DESC
+     LIMIT ?`,
+    [like, like, limit],
+  )
 }
 
-export function conversationExists(id) {
+/* ------------------------------ lifecycle ------------------------------- */
+
+export async function initDb() {
+  return driver.init(SCHEMA)
+}
+
+export async function conversationExists(id) {
   return conversations.exists(id)
 }
 
-export function assertConversationLimit() {
-  if (conversations.count() >= LIMITS.conversations) {
+export async function assertConversationLimit() {
+  if ((await conversations.count()) >= LIMITS.conversations) {
     const err = new Error('conversation_limit')
     err.code = 'conversation_limit'
     throw err
   }
 }
 
-export { LIMITS, path }
+export const dbDriver = driver.DRIVER
+export { LIMITS }

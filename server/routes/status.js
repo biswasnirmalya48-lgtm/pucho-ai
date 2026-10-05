@@ -50,8 +50,8 @@ router.get('/status', rateLimit('read'), async (req, res) => {
     },
     tts: { available: isTtsAvailable() },
     counts: {
-      conversations: conversations.count(),
-      projects: projects.list().length,
+      conversations: await conversations.count(),
+      projects: (await projects.list()).length,
     },
     limits: {
       fileBytes: LIMITS.fileBytes,

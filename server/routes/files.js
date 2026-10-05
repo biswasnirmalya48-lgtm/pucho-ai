@@ -1,16 +1,17 @@
 /**
  * File uploads.
  *
- * Uploads are stored outside the web root with generated names, size- and
- * type-checked, and text is extracted immediately so PUCHO can genuinely read
- * them (or state clearly when it cannot).
+ * Uploads are accepted into memory, written through the storage abstraction
+ * (local disk in development, Vercel Blob on serverless) with generated
+ * names, size- and type-checked, and text is extracted immediately so PUCHO
+ * can genuinely read them (or state clearly when it cannot).
  */
 import express from 'express'
-import fs from 'node:fs'
 import path from 'node:path'
 import multer from 'multer'
 
-import { UPLOAD_DIR, LIMITS, ensureDirs } from '../config.js'
+import { LIMITS } from '../config.js'
+import * as storage from '../storage.js'
 import { extractText, classify, isSupported, SUPPORTED_EXTENSIONS } from '../services/extract.js'
 import { rateLimit } from '../middleware/rateLimit.js'
 import { logger } from '../middleware/errors.js'
@@ -43,19 +44,15 @@ const safeName = (name) =>
     .replace(/[/\\]/g, '_')
     .slice(0, 120) || 'file'
 
-const storage = multer.diskStorage({
-  destination(_req, _file, cb) {
-    ensureDirs()
-    cb(null, UPLOAD_DIR)
-  },
-  filename(_req, file, cb) {
-    const ext = path.extname(safeName(file.originalname)).toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 12)
-    cb(null, `${newId()}${ext}`)
-  },
-})
+const storageKey = (originalName) => {
+  const ext = path.extname(safeName(originalName)).toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 12)
+  return `${newId()}${ext}`
+}
 
 const upload = multer({
-  storage,
+  // Buffers in memory: serverless filesystems are read-only, so nothing may
+  // be written to disk before the storage abstraction accepts it.
+  storage: multer.memoryStorage(),
   limits: { fileSize: LIMITS.fileBytes, files: LIMITS.filesPerMessage, fields: 10 },
   fileFilter(_req, file, cb) {
     const ext = path.extname(safeName(file.originalname)).toLowerCase()
@@ -73,7 +70,7 @@ const upload = multer({
   },
 })
 
-router.post('/', rateLimit('upload'), upload.array('files', LIMITS.filesPerMessage), async (req, res, next) => {
+router.post('/', rateLimit('upload'), upload.array('files', LIMITS.filesPerMessage), async (req, res) => {
   const projectId = optionalId(req.body?.projectId, { field: 'projectId' })
   const conversationId = optionalId(req.body?.conversationId, { field: 'conversationId' })
   const uploaded = req.files || []
@@ -81,74 +78,83 @@ router.post('/', rateLimit('upload'), upload.array('files', LIMITS.filesPerMessa
 
   const created = []
   for (const file of uploaded) {
-    let buffer = Buffer.alloc(0)
-    try {
-      buffer = fs.readFileSync(file.path)
-    } catch {
-      /* handled by the extraction warning below */
-    }
     const name = safeName(file.originalname)
     const kind = classify(name, file.mimetype)
+    const buffer = file.buffer ?? Buffer.alloc(0)
 
     if (!isSupported(name, file.mimetype)) {
-      fs.rmSync(file.path, { force: true })
       throw new ValidationError(`PUCHO cannot read ${name}.`, { code: 'unsupported_file', status: 415 })
     }
 
     const extracted = await extractText({ buffer, name, mime: file.mimetype })
-    const row = files.create({
-      name,
-      size: file.size,
-      mime: String(file.mimetype || 'application/octet-stream'),
-      kind,
-      stored_path: file.path,
-      text: extracted.text,
-      truncated: extracted.truncated,
-      pageCount: extracted.pageCount,
-      warning: extracted.warning,
-      projectId,
-      conversationId,
-    })
-    created.push(row)
-    logger(req, 'info', 'file stored', { name, kind, chars: extracted.text.length, warning: extracted.warning })
+    const mime = String(file.mimetype || 'application/octet-stream')
+    const storedPath = await storage.put(storageKey(name), buffer, mime)
+    try {
+      const row = await files.create({
+        name,
+        size: file.size,
+        mime,
+        kind,
+        stored_path: storedPath,
+        text: extracted.text,
+        truncated: extracted.truncated,
+        pageCount: extracted.pageCount,
+        warning: extracted.warning,
+        projectId,
+        conversationId,
+      })
+      created.push(row)
+      logger(req, 'info', 'file stored', {
+        name,
+        kind,
+        chars: extracted.text.length,
+        warning: extracted.warning,
+      })
+    } catch (err) {
+      // Don't leave an orphaned object behind if the row could not be written.
+      await storage.remove(storedPath)
+      throw err
+    }
   }
 
   res.status(201).json({ files: created })
 })
 
-router.get('/', rateLimit('read'), (req, res) => {
+router.get('/', rateLimit('read'), async (req, res) => {
   const projectId = optionalId(req.query.projectId, { field: 'projectId' })
   const conversationId = optionalId(req.query.conversationId, { field: 'conversationId' })
-  res.json({ files: files.list({ projectId, conversationId, limit: 200 }) })
+  res.json({ files: await files.list({ projectId, conversationId, limit: 200 }) })
 })
 
-router.get('/:id', rateLimit('read'), (req, res) => {
+router.get('/:id', rateLimit('read'), async (req, res) => {
   const id = requireId(req.params.id, { field: 'id' })
-  const row = files.get(id)
+  const row = await files.get(id)
   if (!row) throw new ValidationError('That file is no longer available.', { code: 'not_found', status: 404 })
   res.json({ file: row })
 })
 
 /** Serve the stored bytes (image previews, PDF downloads). */
-router.get('/:id/raw', rateLimit('read'), (req, res) => {
+router.get('/:id/raw', rateLimit('read'), async (req, res) => {
   const id = requireId(req.params.id, { field: 'id' })
-  const row = files.rawRow(id)
+  const row = await files.rawRow(id)
   if (!row) throw new ValidationError('That file is no longer available.', { code: 'not_found', status: 404 })
-  if (!fs.existsSync(row.stored_path)) {
-    throw new ValidationError('That file is no longer on disk.', { code: 'not_found', status: 404 })
+  const stored = await storage.read(row.stored_path)
+  if (!stored) {
+    throw new ValidationError('That file is no longer stored.', { code: 'not_found', status: 404 })
   }
   const disposition = row.kind === 'image' || row.kind === 'pdf' ? 'inline' : 'attachment'
   res.setHeader('Content-Type', row.mime || 'application/octet-stream')
+  res.setHeader('Content-Length', String(stored.size))
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox")
   res.setHeader('Content-Disposition', `${disposition}; filename="${safeName(row.name).replace(/"/g, '')}"`)
-  fs.createReadStream(row.stored_path).pipe(res)
+  res.end(stored.buffer)
 })
 
 /** Extracted text, for "show me what you read". */
-router.get('/:id/text', rateLimit('read'), (req, res) => {
+router.get('/:id/text', rateLimit('read'), async (req, res) => {
   const id = requireId(req.params.id, { field: 'id' })
-  const row = files.rawRow(id)
+  const row = await files.rawRow(id)
   if (!row) throw new ValidationError('That file is no longer available.', { code: 'not_found', status: 404 })
   const limit = Math.min(200_000, Number.parseInt(req.query.limit ?? '20000', 10) || 20_000)
   res.json({
@@ -162,11 +168,11 @@ router.get('/:id/text', rateLimit('read'), (req, res) => {
   })
 })
 
-router.delete('/:id', rateLimit('write'), (req, res) => {
+router.delete('/:id', rateLimit('write'), async (req, res) => {
   const id = requireId(req.params.id, { field: 'id' })
-  const row = files.get(id)
+  const row = await files.get(id)
   if (!row) throw new ValidationError('That file is no longer available.', { code: 'not_found', status: 404 })
-  files.remove(id)
+  await files.remove(id)
   res.json({ ok: true, id })
 })
 

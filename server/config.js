@@ -22,6 +22,8 @@ export const APP_VERSION = '1.0.0'
 export const TAGLINE = 'Bas Pucho.'
 export const NODE_ENV = str(env.NODE_ENV, 'development')
 export const IS_PROD = NODE_ENV === 'production'
+/** True on Vercel (and similar read-only, ephemeral filesystems). */
+export const IS_SERVERLESS = !!str(env.VERCEL) || !!str(env.AWS_LAMBDA_FUNCTION_NAME)
 export const PORT = int(env.PORT, 8787)
 export const HOST = str(env.HOST, '127.0.0.1')
 export const DATA_DIR = path.resolve(ROOT_DIR, str(env.DATA_DIR, 'data'))
@@ -30,10 +32,35 @@ export const DB_PATH = path.join(DATA_DIR, 'pucho.db')
 export const CLIENT_DIST = path.join(ROOT_DIR, 'dist')
 
 export function ensureDirs() {
-  for (const dir of [DATA_DIR, UPLOAD_DIR]) {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+  // Serverless bundles ship a read-only image, so this is best-effort only —
+  // durable state lives in Turso and Vercel Blob instead.
+  if (IS_SERVERLESS) return
+  try {
+    for (const dir of [DATA_DIR, UPLOAD_DIR]) {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    }
+  } catch {
+    /* non-fatal: the database driver falls back to the configured remote store */
   }
 }
+
+/* ------------------------------------------------------------------ *
+ * Persistence.  Local disk when TURSO_DATABASE_URL is unset (dev), a
+ * remote libSQL database when it is present (Vercel).
+ * ------------------------------------------------------------------ */
+export const TURSO = {
+  url: str(env.TURSO_DATABASE_URL),
+  authToken: str(env.TURSO_AUTH_TOKEN),
+}
+export const USE_TURSO = !!TURSO.url
+
+/* ------------------------------------------------------------------ *
+ * Uploaded file bytes: local disk in dev, Vercel Blob in production.
+ * ------------------------------------------------------------------ */
+export const BLOB = {
+  token: str(env.BLOB_READ_WRITE_TOKEN),
+}
+export const USE_BLOB = !!BLOB.token
 
 /* ------------------------------------------------------------------ *
  * GROQ configuration.  The API key never leaves the server process.

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 data/
+data-*/
 uploads/
 .env
 .env.local
@@ -8,6 +9,7 @@ uploads/
 *.log
 .DS_Store
 .vite/
+.vercel/
 coverage/
 *.tsbuildinfo
 

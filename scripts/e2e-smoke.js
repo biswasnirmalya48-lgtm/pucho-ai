@@ -145,6 +145,36 @@ let assistantMessageId = null
 let answerSample = ''
 
 /**
+ * Choose a search needle that is genuinely contiguous inside the answer and
+ * absent from the question that produced it.
+ *
+ * Two traps this avoids:
+ *  - Stripping punctuation across the whole answer splices words together
+ *    across the punctuation ("said: _How" → "said How"), producing a string
+ *    that never appears verbatim and so can never match.
+ *  - The model echoes the prompt, so a sample shared with the question would
+ *    legitimately match the *question* instead of the answer.
+ */
+function pickSearchSample(text, exclude = '') {
+  const lowerExclude = String(exclude).toLowerCase()
+  const runs = String(text)
+    .replace(/[^a-zA-Z0-9 ]+/g, '\n')
+    .split('\n')
+    .map((run) => run.replace(/\s+/g, ' ').trim())
+    .filter((run) => run.split(' ').length >= 3)
+    .sort((a, b) => b.length - a.length)
+
+  for (const run of runs) {
+    const words = run.split(' ')
+    for (const take of [6, 5, 4, 3]) {
+      const sample = words.slice(0, take).join(' ')
+      if (!lowerExclude.includes(sample.toLowerCase())) return sample
+    }
+  }
+  return ''
+}
+
+/**
  * Chat with one retry when the upstream provider is rate limiting us.
  * PUCHO already reports that honestly; this just keeps a burst-based suite
  * from failing on a free-tier limit that a human user would never hit.
@@ -195,8 +225,10 @@ await check('GET /api/status never leaks the API key', async () => {
 
 /* -------------------------------- chat --------------------------------- */
 console.log('\nchat + streaming')
+const FIRST_PROMPT = `How does quantum tunneling work?${SHORT}`
+
 await check('send streams deltas and finishes with done', async () => {
-  const result = await chat({ content: `How does quantum tunneling work?${SHORT}`, mode: 'fast' })
+  const result = await chat({ content: FIRST_PROMPT, mode: 'fast' })
   assert.ok(result.open?.conversationId, 'no conversation id')
   assert.ok(result.meta?.assistantMessageId, 'no assistant message id')
   assert.ok(result.byType('delta').length > 3, 'expected multiple deltas')
@@ -204,7 +236,7 @@ await check('send streams deltas and finishes with done', async () => {
   assert.ok(result.done?.message?.content.includes(result.text.slice(0, 20)), 'saved content mismatch')
   conversationId = result.open.conversationId
   assistantMessageId = result.meta.assistantMessageId
-  answerSample = result.text.replace(/[^a-zA-Z0-9 ]/g, ' ').split(/\s+/).filter(Boolean).slice(4, 8).join(' ')
+  answerSample = pickSearchSample(result.text, FIRST_PROMPT)
 })
 
 await check('conversation is auto-titled from the first message', async () => {

@@ -11,6 +11,7 @@ white, glass used sparingly — and none of the usual AI-clone furniture.
 browser ──HTTP/SSE──▶ PUCHO server ──HTTPS──▶ GROQ API ──▶ model
                           │
                           └── SQLite (chats, messages, projects, files, settings)
+                              node:sqlite locally · libSQL/Turso on Vercel
 ```
 
 The GROQ key is read from the environment **inside the server process only**.
@@ -33,7 +34,7 @@ For development (client on :5173 with hot reload, API on :8787):
 npm run dev
 ```
 
-Requires Node.js 20.11+ (uses the built-in `node:sqlite`; Node 22+ recommended).
+Requires Node.js 22.5+ (uses the built-in `node:sqlite`).
 
 ---
 
@@ -171,9 +172,20 @@ server log.
 
 ## Data
 
-Everything lives in `DATA_DIR` (default `data/`): `pucho.db` (SQLite, WAL) and
-`uploads/`. **Settings → Data** exports every conversation as JSON and can
-delete all chats. Deleting a conversation also removes its stored files.
+Locally everything lives in `DATA_DIR` (default `data/`): `pucho.db` (SQLite,
+WAL) and `uploads/`. **Settings → Data** exports every conversation as JSON and
+can delete all chats. Deleting a conversation also removes its stored files.
+
+On Vercel both of those move to hosted services, because a serverless function
+has no persistent disk:
+
+| What | Local | Vercel | Env var |
+| --- | --- | --- | --- |
+| Database | `data/pucho.db` (`node:sqlite`) | Turso / libSQL | `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` |
+| Uploaded bytes | `data/uploads/` | Vercel Blob | `BLOB_READ_WRITE_TOKEN` |
+
+The SQL is identical on both — [`server/driver.js`](server/driver.js) picks the
+driver at boot, so nothing above it knows or cares where state lives.
 
 ---
 
@@ -188,13 +200,43 @@ delete all chats. Deleting a conversation also removes its stored files.
 | *“Server-side speech is not configured.”* | Expected — PUCHO falls back to the browser's voices. |
 | Port 8787 busy | `PORT=8788 npm start`. |
 
+## Deploying to Vercel
+
+```bash
+npx vercel link          # once
+npx vercel env add GROQ_API_KEY production
+npx vercel env add TURSO_DATABASE_URL production
+npx vercel env add TURSO_AUTH_TOKEN production
+npx vercel env add BLOB_READ_WRITE_TOKEN production
+npx vercel --prod
+```
+
+`vercel.json` builds the client with `npm run build`, serves `dist/` as static
+assets, and routes every `/api/*` request to the single function in
+[`api/index.js`](api/index.js). That function imports the same Express app the
+local server uses, so SSE streaming, rate limiting, validation and error
+mapping behave identically.
+
+Notes:
+
+- The GROQ key is a server-side variable only — never prefix it with `NEXT_PUBLIC_`.
+- `maxDuration` is 60s so a long answer can finish streaming.
+- Cold starts reuse the Turso connection between invocations on the same instance.
+- Rate limits are per-instance, so they are approximate across many concurrent
+  instances. Tighten with `RATE_LIMIT_*` if you need a hard global cap.
+
+---
+
 ## Project layout
 
 ```
 server/
-  index.js            express app, security headers, static client
+  index.js            local server entry (listens)
+  app.js              express app: security headers, routes, static client
+  driver.js           SQLite access: node:sqlite locally, libSQL/Turso remotely
+  storage.js          upload bytes: local disk or Vercel Blob
   config.js           env, limits, per-mode model defaults
-  db.js               SQLite schema + queries
+  db.js               schema + queries (async, driver-agnostic)
   routes/             chat (SSE), conversations, projects, files, settings, status, voice
   services/           groq client, model resolution, prompt, titling, web search, extraction, tts
   lib/                validation, SSE writer
@@ -203,4 +245,6 @@ client/
   src/lib/            store, api, types, i18n, formatting
 tests/                node:test unit suites
 scripts/              mock provider, end-to-end smoke suite
+api/index.js          Vercel serverless entry
+vercel.json           build, output dir, function + rewrites
 ```
